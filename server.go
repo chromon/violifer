@@ -106,6 +106,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 	// 等待直到所有请求都被处理
 	wg := new(sync.WaitGroup)
 
+	// 在一次连接中，允许接收多个请求，即多个 request header 和 request body
 	for {
 		// 读取请求
 		req, err := server.readRequest(cc)
@@ -127,7 +128,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 	_ = cc.Close()
 }
 
-// 封装一个请求的所有信息
+// 封装一个请求的所有信息 header 和 argv/replyv 组成的 body
 type request struct {
 	// 请求 header
 	h *codec.Header

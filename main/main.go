@@ -1,13 +1,12 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 	"violifer"
-	"violifer/codec"
 )
 
 func startServer(addr chan string) {
@@ -23,33 +22,30 @@ func startServer(addr chan string) {
 }
 
 func main() {
+	log.SetFlags(0)
 	addr := make(chan string)
 	go startServer(addr)
 
-	// 连接网络地址并返回 conn
-	// 从通道中获取服务端地址
-	conn, _ := net.Dial("tcp", <- addr)
+	client, _ := violifer.Dial("tcp", <- addr)
 	defer func() {
-		_ = conn.Close()
+		_ = client.Close()
 	}()
 
 	time.Sleep(time.Second)
-	// 将 DefaultOption 的 json 编码写入 conn 中
-	_ = json.NewEncoder(conn).Encode(violifer.DefaultOption)
-	cc := codec.NewGobCodec(conn)
 
+	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
-		h := &codec.Header{
-			ServiceMethod: "foo.Sum",
-			Seq: uint64(i),
-		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
 
-		// 将数据写入到 conn
-		_ = cc.Write(h, fmt.Sprintf("rpc req %d", h.Seq))
-		_ = cc.ReadHeader(h)
-		var reply string
-		_ = cc.ReadBody(&reply)
-		log.Println("reply:", reply)
+			args := fmt.Sprintf("rpc req %d", i)
+			var reply string
+			if err := client.Call("Foo.Sum", args, &reply); err != nil {
+				log.Fatal("call Foo.Sum error:", err)
+			}
+			log.Println("reply:", reply)
+		}(i)
 	}
-
+	wg.Wait()
 }
