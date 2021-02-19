@@ -7,7 +7,7 @@ import (
 	"log"
 )
 
-// gob 编解码方式，实现 Codec 接口
+// gob 编解码并读写方式，实现 Codec 接口
 type GobCodec struct {
 	// TCP 或者 Unix 建立 socket 时得到的链接实例
 	conn io.ReadWriteCloser

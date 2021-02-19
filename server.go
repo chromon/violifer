@@ -2,11 +2,12 @@ package violifer
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"violifer/codec"
 )
@@ -40,7 +41,9 @@ RPC 客户端固定采用 JSON 编码 Option，后续的 header 和 body 的编�
  */
 
 // RPC Server
-type Server struct {}
+type Server struct {
+	serviceMap sync.Map
+}
 
 func NewServer() *Server {
 	return &Server{}
@@ -136,6 +139,10 @@ type request struct {
 	argv reflect.Value
 	// 请求的返回值
 	replyv reflect.Value
+	// 方法实例
+	mtype *methodType
+	// service 实例
+	svc *service
 }
 
 // 读取请求 header
@@ -159,12 +166,27 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	}
 
 	req := &request{h: h}
-
-	// TODO 假定请求参数类型是 string
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server - read argv err:", err)
+	// 将传入的 service 和 method 反射
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
 	}
+	// 分别创建两个入参实例：参数实例、返回值实例
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		// 确保 argvi 是指针，因为 ReadBody 方法需要一个指针作为参数
+		argvi = req.argv.Addr().Interface()
+	}
+
+	// 通过 ReadBody 将请求报文反序列化为第一个入参 argvi
+	if err = cc.ReadBody(argvi); err != nil {
+		log.Println("rpc server - read body err: ", err)
+		return req, err
+	}
+
 	return req, nil
 }
 
@@ -182,9 +204,56 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header,
 // 处理请求
 func (server *Server) handleRequest(cc codec.Codec, req *request,
 		sendingMutex *sync.Mutex, wg *sync.WaitGroup) {
-	// TODO 调用注册的 rpc 方法得到返回值 replyv
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("rpc resp %d", req.h.Seq))
+
+	// 调用注册的 rpc 方法得到返回值 replyv
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(cc, req.h, invalidRequest, sendingMutex)
+		return
+	}
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sendingMutex)
+}
+
+// 注册 service
+func (server *Server) Register(rcvr interface{}) error {
+	s := newService(rcvr)
+	// LoadOrStore(key, value) 如果 key 存在，则返回 key 对应的元素
+	// 如果 key 不存在，则返回设置的 value，并将 value 存入 map 中
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc - service already defined:" + s.name)
+	}
+	return nil
+}
+
+// 默认注册 service
+func Register(rcvr interface{}) error {
+	return DefaultServer.Register(rcvr)
+}
+
+// 通过 serviceMethod 从 serviceMap 中查找对应的 service
+func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		// service.method 格式错误
+		err = errors.New("rpc server - service/method request ill-formed: " + serviceMethod)
+		return
+	}
+
+	// 分割 service 和 method
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot + 1:]
+	// serviceMap 中加载对应的 service 实例
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		// 加载失败，实例不存在
+		err = errors.New("rpc server - can't find service: " + serviceName)
+	}
+	// 从 service 实例的 method 中，找到对应的 methodType
+	svc = svci.(*service)
+	mtype = svc.method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server - can't find method: " + methodName)
+	}
+	return
 }

@@ -19,7 +19,7 @@ type Header struct {
 	Error string
 }
 
-// 对消息体进行编解码的接口，抽象出来可以实现不同的 Codec
+// 对消息体进行编解码并读写的接口，抽象出来可以实现不同的 Codec
 type Codec interface {
 	ReadHeader(*Header) error
 	ReadBody(interface{}) error
