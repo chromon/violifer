@@ -1,6 +1,7 @@
 package violifer
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 	"violifer/codec"
 )
 
@@ -218,15 +220,24 @@ func parseOptions(opts ...*Option) (*Option, error) {
 	return opt, nil
 }
 
-// 使用用户传入的服务端地址信息，创建 Client 实例
-func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+// 用于处理客户端连接超时封装了客户端和超时错误信息
+type clientResult struct {
+	client *Client
+	err error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+// 处理连接超时
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
+	// 解析 options
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	// 建立与 RPC 服务端连接
-	conn, err := net.Dial(network, address)
+	// 建立与 RPC 服务端连接，net.Dial 替换为 net.DialTimeout，如果连接创建超时，将返回错误
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -234,13 +245,35 @@ func Dial(network, address string, opts ...*Option) (client *Client, err error) 
 	// 如果新建客户端为 nil，关闭连接
 	// defer 语句执行在 return 语句赋值之后，方法结束之前
 	defer func() {
-		if client == nil {
+		if err != nil {
 			_ = conn.Close()
 		}
 	}()
 
-	// 返回新建 client 实例
-	return NewClient(conn, opt)
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+
+	// 连接超时不设限，直接返回结果
+	if opt.ConnectTimeout == 0 {
+		result := <- ch
+		return result.client, result.err
+	}
+
+	select {
+	case <- time.After(opt.ConnectTimeout):
+		// 连接超时
+		return nil, fmt.Errorf("rpc client - connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <- ch:
+		return result.client, result.err
+	}
+}
+
+// 使用用户传入的服务端地址信息，创建 Client 实例
+func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 // 发送请求
@@ -293,7 +326,20 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 }
 
 // Call 是对 Go 的封装，阻塞 call.Done，等待响应返回，是一个同步接口
-func (client *Client) Call(serviceMethod string , args, reply interface{}) error {
-	call := <- client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
+// Client.Call 的超时处理机制，使用 context 包实现，控制权交给用户，控制更为灵活
+// 用户可以使用 context.WithTimeout 创建具备超时检测能力的 context 对象来控制
+// 例如：
+// ctx, _ := context.WithTimeout(context.Background(), time.Second)
+// var reply int
+// err := client.Call(ctx, "Foo.Sum", &Args{1, 2}, &reply)
+func (client *Client) Call(ctx context.Context, serviceMethod string , args, reply interface{}) error {
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <- ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client - call failed: " + ctx.Err().Error())
+	case call := <- call.Done:
+		return call.Error
+	}
 	return call.Error
 }

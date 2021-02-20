@@ -3,12 +3,14 @@ package violifer
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 	"violifer/codec"
 )
 
@@ -20,12 +22,17 @@ type Option struct {
 	MagicNumber int
 	// 消息的编解码方式
 	CodecType codec.Type
+	// 连接超时时间，默认 10 秒
+	ConnectTimeout time.Duration
+	// 处理超时时间，默认值为 0， 即不设限
+	HandleTimeout time.Duration
 }
 
 // 默认协议信息
 var DefaultOption = &Option {
 	MagicNumber: MagicNumber,
 	CodecType: codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 /*
@@ -97,13 +104,13 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	}
 
 	// 根据对应编解码器处理请求
-	server.serveCodec(f(conn))
+	server.serveCodec(f(conn), &opt)
 }
 
 var invalidRequest = struct{}{}
 
 // 请求处理（读取、处理、响应）
-func (server *Server) serveCodec(cc codec.Codec) {
+func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
 	// 处理请求是并发的，必须确保回复请求（加锁）发送一个完整响应报文（并发会导致报文交叉，无法解析）
 	sendingMutex := new(sync.Mutex)
 	// 等待直到所有请求都被处理
@@ -125,7 +132,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 		}
 		wg.Add(1)
 		// 并发处理请求
-		go server.handleRequest(cc, req, sendingMutex, wg)
+		go server.handleRequest(cc, req, sendingMutex, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -202,18 +209,45 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header,
 }
 
 // 处理请求
+// 与客户端连接超时类似，使用 time.After() 结合 select + chan 完成服务端超时处理
 func (server *Server) handleRequest(cc codec.Codec, req *request,
-		sendingMutex *sync.Mutex, wg *sync.WaitGroup) {
+		sendingMutex *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
 
-	// 调用注册的 rpc 方法得到返回值 replyv
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, sendingMutex)
+	// 为确保 sendResponse 仅调用一次，因此将整个过程拆分为 called 和 sent 两个阶段
+	called := make(chan struct{})
+	sent := make(chan struct{})
+
+	go func() {
+		// 调用注册的 rpc 方法得到返回值 replyv
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, sendingMutex)
+			sent <- struct{}{}
+			return
+		}
+		server.sendResponse(cc, req.h, req.replyv.Interface(), sendingMutex)
+		sent <- struct{}{}
+	}()
+
+	if timeout == 0 {
+		<- called
+		<- sent
 		return
 	}
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sendingMutex)
+
+	// called 信道接收到消息，代表处理没有超时，继续执行 sendResponse
+	// time.After() 先于 called 接收到消息，说明处理已经超时，called 和 sent 都将被阻塞
+	// 在 case <-time.After(timeout) 处调用 sendResponse
+	select {
+	case <- time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server - request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sendingMutex)
+	case <- called:
+		<- sent
+	}
 }
 
 // 注册 service
