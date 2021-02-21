@@ -1,6 +1,7 @@
 package violifer
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 	"violifer/codec"
@@ -341,5 +344,49 @@ func (client *Client) Call(ctx context.Context, serviceMethod string , args, rep
 	case call := <- call.Done:
 		return call.Error
 	}
-	return call.Error
+}
+
+// 客户端 HTTP 协议支持
+// 服务端已经能够接受 CONNECT 请求，并返回了 200 状态码 HTTP/1.0 200 Connected to RPC
+// 客户端要做的，发起 CONNECT 请求，检查返回状态码即可成功建立连接
+
+// 通过 HTTP 协议创建客户端实例
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+
+	// HTTP 协议转换为 RPC 协议之前，需要服务端成功的 HTTP 响应
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response:" + resp.Status)
+	}
+	return nil, err
+}
+
+// 连接到指定的 HTTP RPC server，并在默认的 HTTP RPC path 监听
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// 根据 RPCAddr 调用不同函数连接 RPC server
+// rpcAddr 格式： protocol@addr
+// http@10.0.0.1:7001, tcp@10.0.0.1:8001
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		// http 协议
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp，unix 等协议
+		return Dial(protocol, addr, opts...)
+	}
+
 }

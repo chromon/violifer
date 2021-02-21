@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -290,4 +291,48 @@ func (server *Server) findService(serviceMethod string) (svc *service, mtype *me
 		err = errors.New("rpc server - can't find method: " + methodName)
 	}
 	return
+}
+
+// 服务端 HTTP 协议支持
+const (
+	connected = "200 Connected to RPC"
+	defaultRPCPath = "/_rpc_"
+	defaultDebugPath = "/debug/rpc"
+)
+
+// 实现 http.Handler 的 ServeHTTP 方法来回答 RPC 请求
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// 只接受 HTTP CONNECT 请求
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+
+	// Hijack 让调用者接管连接，返回连接和关联到该连接的一个缓冲读写器
+	// 调用本方法后，HTTP 服务端将不再对连接进行任何操作，调用者有责任管理、关闭返回的连接
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr,": ", err.Error())
+		return
+	}
+	// 返回了 200 状态码 HTTP/1.0 200 Connected to RPC
+	_, _ = io.WriteString(conn, "HTTP/1.0 " + connected + "\n\n")
+	server.ServeConn(conn)
+}
+
+// HandleHTTP 在 rpcPath 上为 RPC 消息注册了一个 HTTP 处理程序
+func (server *Server) HandleHTTP() {
+	// func Handle(pattern string, handler Handler)
+	// 注册 HTTP 处理器 handler 和对应的模式 pattern（注册到 DefaultServeMux）
+	http.Handle(defaultRPCPath, server)
+
+	// 注册 debugging handler 在 debugPath
+	http.Handle(defaultDebugPath, debugHTTP{server})
+	log.Println("rpc server debug path:", defaultDebugPath)
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }
