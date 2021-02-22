@@ -18,7 +18,7 @@ import (
 // 标记这是一个 Violifer RPC 请求
 const MagicNumber = 0x7a736b
 
-// 客户端与服务端通信协议协商的相关信息，如消息的编解码方式
+// 客户端与服务端通信协议协商的相关信息（协议选项），如消息的编解码方式
 type Option struct {
 	MagicNumber int
 	// 消息的编解码方式
