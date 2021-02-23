@@ -4,9 +4,11 @@ import (
 	"context"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 	"violifer"
+	"violifer/registry"
 	"violifer/xclient"
 )
 
@@ -26,13 +28,21 @@ func (f Foo) Sleep(args Args, reply *int) error {
 	return nil
 }
 
-func startServer(addrCh chan string) {
+func startRegistry(wg *sync.WaitGroup) {
+	l, _ := net.Listen("tcp", ":9999")
+	registry.HandleHTTP()
+	wg.Done()
+	_ = http.Serve(l, nil)
+}
+
+func startServer(registryAddr string, wg *sync.WaitGroup) {
 	var foo Foo
 	// 返回在 addr 上监听的 listener
 	l, _ := net.Listen("tcp", ":0")
 	server := violifer.NewServer()
 	_ = server.Register(&foo)
-	addrCh <- l.Addr().String()
+	registry.Heartbeat(registryAddr, "tcp@" + l.Addr().String(), 0)
+	wg.Done()
 	server.Accept(l)
 }
 
@@ -56,9 +66,9 @@ func foo(xc *xclient.XClient, ctx context.Context, typ, serviceMethod string, ar
 }
 
 // 调用单个服务实例
-func call(addr1, addr2 string) {
+func call(registry string) {
 
-	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+	d := xclient.NewRegistryDiscovery(registry, 0)
 	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 
 	defer func() {
@@ -78,8 +88,8 @@ func call(addr1, addr2 string) {
 }
 
 // 调用所有服务实例
-func broadcast(addr1, addr2 string) {
-	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+func broadcast(registry string) {
+	d := xclient.NewRegistryDiscovery(registry, 0)
 	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 
 	defer func() {
@@ -102,17 +112,21 @@ func broadcast(addr1, addr2 string) {
 
 func main() {
 	log.SetFlags(0)
-	ch1 := make(chan string)
-	ch2 := make(chan string)
+
+	registryAddr := "http://localhost:9999/_rpc/registry"
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go startRegistry(&wg)
+	wg.Wait()
 
 	// 启动两个服务器
-	go startServer(ch1)
-	go startServer(ch2)
-
-	addr1 := <- ch1
-	addr2 := <- ch2
+	time.Sleep(time.Second)
+	wg.Add(2)
+	go startServer(registryAddr, &wg)
+	go startServer(registryAddr, &wg)
+	wg.Wait()
 
 	time.Sleep(time.Second)
-	call(addr1, addr2)
-	broadcast(addr1, addr2)
+	call(registryAddr)
+	broadcast(registryAddr)
 }
